@@ -146,6 +146,10 @@ define([
         this._pickId = undefined;
         this._totalMemoryUsageInBytes = 0;
         this._frames = [];
+
+        // For calculation average load time
+        this._runningLoadTime = 0.0;
+        this._runningLoadedFramesLength = 0;
     }
 
     defineProperties(TimeDynamicPointCloud.prototype, {
@@ -208,48 +212,76 @@ define([
         this._styleDirty = true;
     };
 
-    function getApproachingInterval(that) {
+    function getAverageLoadTime(that) {
+        if (that._runningLoadedFramesLength === 0) {
+            return undefined;
+        }
+
+        var averageLoadTime =  that._runningLoadTime / that._runningLoadedFramesLength;
+        return averageLoadTime * 2.0; // Provide additional buffer since the actual load time fluctuates
+    }
+
+    var scratchDate = new JulianDate();
+
+    function getNextInterval(that) {
         var intervals = that._intervals;
         var clock = that._clock;
-        var time = clock.currentTime;
         var isAnimating = clock.canAnimate && clock.shouldAnimate;
         var multiplier = clock.multiplier;
 
-        if (!isAnimating && multiplier !== 0) {
+        // TODO : can it be animating but multiplier = 0?
+        if (!isAnimating) {
             return undefined;
         }
 
-        var seconds;
+        var averageLoadTime = getAverageLoadTime(that);
+        if (!defined(averageLoadTime)) {
+            // Don't return the next interval until there is an average load time
+            return undefined;
+        }
+
+        var time = JulianDate.addSeconds(clock.currentTime, averageLoadTime * multiplier, scratchDate);
         var index = intervals.indexOf(time);
-        if (index === -1) {
-            return undefined;
-        }
 
-        var interval = intervals.get(index);
-        if (multiplier > 0) { // animating forward
-            seconds = JulianDate.secondsDifference(interval.stop, time);
+        if (multiplier >= 0) {
             ++index;
-        } else { //backwards
-            seconds = JulianDate.secondsDifference(interval.start, time); // Will be negative
+        } else {
             --index;
         }
-        seconds /= multiplier; // Will always be positive
 
-        // Less than 5 wall time seconds
-        return (index >= 0 && seconds <= 5.0) ? intervals.get(index) : undefined;
+        // Returns undefined if not in range
+        return intervals.get(index);
+    }
+
+    function getCurrentInterval(that) {
+        var intervals = that._intervals;
+        var clock = that._clock;
+        var time = clock.currentTime;
+        var index = intervals.indexOf(time);
+
+        // Returns undefined if not in range
+        return intervals.get(index);
     }
 
     function getLastReadyFrame(that, interval) {
         var i;
+        var lookbackIndex;
         var frame;
+        var lookbackFrames = 10; // TODO : always look back the maximum amount? Like if multiplier is really fast?
         var frames = that._frames;
         var clock = that._clock;
+        var isAnimating = clock.canAnimate && clock.shouldAnimate;
         var multiplier = clock.multiplier;
         var index = getIntervalIndex(that, interval);
 
+        if (!isAnimating) {
+            return undefined;
+        }
+
         if (multiplier >= 0) {
             // Animating forwards, so look backwards
-            for (i = index - 1; i >= 0; --i) {
+            lookbackIndex = Math.max(index - lookbackFrames, 0);
+            for (i = index - 1; i >= lookbackIndex; --i) {
                 frame = frames[i];
                 if (defined(frame) && frame.ready) {
                     return frame;
@@ -257,8 +289,8 @@ define([
             }
         } else {
             // Animating backwards, so look forwards
-            var length = frames.length;
-            for (i = index + 1; i < length; ++i) {
+            lookbackIndex = Math.min(index + lookbackFrames, frames.length - 1);
+            for (i = index + 1; i <= lookbackIndex; ++i) {
                 frame = frames[i];
                 if (defined(frame) && frame.ready) {
                     return frame;
@@ -271,28 +303,18 @@ define([
         return that._intervals.indexOf(interval.start);
     }
 
-    function getCurrentInterval(that) {
-        var intervals = that._intervals;
-        var clock = that._clock;
-        var time = clock.currentTime;
-        var index = intervals.indexOf(time);
-        if (index === -1) {
-            return undefined;
-        }
-        return intervals.get(index);
-    }
-
-    function requestFrame(that, interval) {
+    function requestFrame(that, interval, frameState) {
         var index = getIntervalIndex(that, interval);
         var frames = that._frames;
         var frame = frames[index];
         if (!defined(frame)) {
             frame = {
-                pointCloud : undefined,
+                pointCloud : undefined, // Created after request resolves
                 transform : interval.data.transform,
-                loadDuration : getTimestamp(), // Updated after the frame is loaded
-                ready : false,
-                touchedFrameNumber : 0
+                timestamp : getTimestamp(),
+                sequential : true, // Whether the frame was loaded in sequential updates
+                ready : false, // True once point cloud is ready
+                touchedFrameNumber : frameState.frameNumber
             };
             frames[index] = frame;
             Resource.fetchArrayBuffer({
@@ -312,23 +334,30 @@ define([
     }
 
     function prepareFrame(that, frame, frameState) {
-        var pointCloud = frame.pointCloud;
-        if (!defined(pointCloud)) {
-            // Still waiting on the request to finish
-            return;
+        if (frame.touchedFrameNumber < frameState.frameNumber - 1) {
+            // If this frame was not loaded in sequential updates then it can't be used it for calculating average load time.
+            // For example: selecting a frame on the timeline, selecting another frame before the request finishes, then selecting this frame later.
+            frame.sequential = false;
         }
 
-        if (!frame.ready) {
+        var pointCloud = frame.pointCloud;
+
+        if (defined(pointCloud) && !frame.ready) {
             // Call update to prepare renderer resources. Don't render anything yet.
             var commandList = frameState.commandList;
             var lengthBeforeUpdate = commandList.length;
             pointCloud.update(frameState);
+
             if (pointCloud.ready) {
                 // Point cloud became ready this update
                 frame.ready = true;
-                frame.loadDuration = getTimestamp() - frame.loadDuration;
                 that._totalMemoryUsageInBytes += pointCloud.geometryByteLength;
                 commandList.length = lengthBeforeUpdate; // Don't allow preparing frame to insert commands.
+                if (frame.sequential) {
+                    // Update the values used to calculate average load time
+                    that._runningLoadTime += (getTimestamp() - frame.timestamp);
+                    ++that._runningLoadedFramesLength;
+                }
             }
         }
     }
@@ -359,7 +388,7 @@ define([
     }
 
     function loadFrame(that, interval, frameState) {
-        var frame = requestFrame(that, interval);
+        var frame = requestFrame(that, interval, frameState);
         prepareFrame(that, frame, frameState);
         frame.touchedFrameNumber = frameState.frameNumber;
         return frame;
@@ -392,6 +421,8 @@ define([
             }
         }
     }
+
+    // TODO : if no frames have been loaded (don't know a load duration yet
 
     // TODO : need to take into account current real-time time it takes to process an average tile, because just fetching the next interval is naive
     // TODO : make sure it works if clock is stopped
@@ -452,6 +483,24 @@ define([
         var frame;
 
         var currentInterval = getCurrentInterval(this);
+        var nextInterval = getNextInterval(this);
+
+        if (defined(nextInterval)) {
+            loadFrame(this, nextInterval, frameState);
+        }
+
+        // If there is no next interval, find a next interval.
+        // If the current interval is the next interval (or has exceeded the next interval), then find a new next interval
+        // That means next interval needs to be stored somewhere.
+
+
+
+        // What to do if timer is going really fast
+
+        // TODO : get approaching frame.
+        // don't load the current frame if we are skipping it - how to do that
+        // What if we skipped past the current frame?
+
         if (defined(currentInterval)) {
             frame = loadFrame(this, currentInterval, frameState);
 
